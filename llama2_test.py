@@ -305,13 +305,13 @@ class Transformer(nn.Module):
         return output
 
 config = ModelArgs(n_kv_heads=8)
-
-# sd = model.state_dict()
-# for k,v in sd.items():
-#     with open("llama2_kv_4.txt", "a") as f:
-#         f.writelines(str(k) + " " + str(v.shape) + "\n")
+model = Transformer(config)
+sd = model.state_dict()
+for k,v in sd.items():
+    with open("llama2_kv_4.txt", "a") as f:
+        f.writelines(str(k) + " " + str(v.shape) + "\n")
 # print(torch.cuda.current_device())
-for i in range(8):
-    inp = torch.ones(size=(8,512), dtype=torch.long).to(f'cuda:{i}')
-    model = Transformer(config).cuda(i)
-    out = model(inp[:, 0:20], 0)
+# for i in range(8):
+#     inp = torch.ones(size=(8,512), dtype=torch.long).to(f'cuda:{i}')
+#     model = Transformer(config).cuda(i)
+#     out = model(inp[:, 0:20], 0)

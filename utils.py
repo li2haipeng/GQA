@@ -46,22 +46,36 @@ def dataset_mapping(trained_tokenizer, raw_dataset, max_seq_length):
     return tokenized_datasets
 
 
-def group_weight(w, hidden_s, q_per_group):
+# def group_weight(w, hidden_s, q_per_group):
+#         w_l = list()
+#         g = int(hidden_s / q_per_group)
+#         if len(w.shape) == 2:
+#             for i in range(g):
+#                 a = w[i * q_per_group: (i + 1) * q_per_group, :]
+#                 grouped_w = torch.mean(a, dim=0, keepdim=True)
+#                 w_l.append(grouped_w)
+#             w_l = torch.cat(w_l, dim=0)
+#         elif len(w.shape) == 1:
+#             for i in range(g):
+#                 a = w[i * q_per_group: (i + 1) * q_per_group]
+#                 grouped_w = torch.mean(a)
+#                 w_l.append(grouped_w)
+#             w_l = torch.stack(w_l)
+#         # equal = torch.equal(w, w_l)
+
+#         return w_l
+
+def group_weight(w, q_h, q_per_group):
         w_l = list()
-        g = int(hidden_s / q_per_group)
-        if len(w.shape) == 2:
-            for i in range(g):
-                a = w[i * q_per_group: (i + 1) * q_per_group, :]
-                grouped_w = torch.mean(a, dim=0, keepdim=True)
-                w_l.append(grouped_w)
-            w_l = torch.cat(w_l, dim=0)
-        elif len(w.shape) == 1:
-            for i in range(g):
-                a = w[i * q_per_group: (i + 1) * q_per_group]
-                grouped_w = torch.mean(a)
-                w_l.append(grouped_w)
-            w_l = torch.stack(w_l)
-        # equal = torch.equal(w, w_l)
+        g = int(q_h / q_per_group)
+        assert len(w.shape) == 2
+        
+        w = w.chunk(g, dim = 0)
+        for i in range(g):
+            qw = list(w[i].chunk(q_per_group, dim = 0))
+            grouped_w = torch.sum(torch.stack(qw), dim=0) / q_per_group
+            w_l.append(grouped_w)
+        w_l = torch.cat(w_l, dim=0)
 
         return w_l
 

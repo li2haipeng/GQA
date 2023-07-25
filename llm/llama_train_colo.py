@@ -274,6 +274,7 @@ def get_size(bytes, suffix="B"):
 
 def train():
     tp_degree = 8
+    dims = 0
     # for LLaMA models
     import transformers.models.llama.modeling_llama
     # Launch ColossalAI
@@ -292,10 +293,10 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # with PipelinableContext():
-    default_dist_spec = ShardSpec([-1], [tp_degree])
+    default_dist_spec = ShardSpec([dims], [tp_degree])
     model_config = AutoConfig.from_pretrained(model_args.model_name_or_path)
 
-    model_config.update({"kv_h": 8})
+    model_config.update({"kv_h": 16})
     model_config.save_pretrained("gqa_llama")
 
     with ColoInitContext(device=get_current_device(), default_dist_spec=default_dist_spec, default_pg=shard_pg):
@@ -367,20 +368,19 @@ def train():
     # for n, p in pretrained_state.items():
     #     with open("1.txt", "a") as f:
     #         f.writelines(str(n) + " " + str(p.shape) + "\n")  
-    # for n, p in model.named_parameters():
-    #     with open("row_gqa_4.txt", "a") as f:
-    #     # print(list(pretrained_state.keys())[i], list(pretrained_state.values())[i].shape)
-    #         f.writelines(str(n) + " " + str(p.shape) + "\n")
+    for n, p in model.named_parameters():
+        with open(f"row_gqa_{model_config.kv_h}.txt", "a") as f:
+        # print(list(pretrained_state.keys())[i], list(pretrained_state.values())[i].shape)
+            f.writelines(str(n) + " " + str(p.shape) + "\n")
     # sys.exit()
 
     for n, p in model.named_parameters():
         x = pretrained_state[n]
         # print(n)
         if not 'norm' in n:
-            x = x.chunk(tp_degree, dim=-1)
+            x = x.chunk(tp_degree, dim=dims)
             x = x[dist.get_rank() % tp_degree]
             q_per_group = model_config.num_attention_heads // model_config.kv_h
-
             if 'k_proj' in n or 'v_proj' in n:
                 x = utils.group_weight(x, x.shape[0], q_per_group)
         # if (x.shape != p.shape):
@@ -456,7 +456,7 @@ def train():
                     dataloader, booster, coordinator)
     logger.info(f"Finish finetuning, time:{time.time()-start}", ranks=[0])
 
-    output_dir = f'/home/ubuntu/gqa/trained/gqa_{model_config.kv_h}_shard_colo_llama-7b/' + \
+    output_dir = f'/home/ubuntu/GQA/trained/gqa_{model_config.kv_h}_shard_colo_llama-7b/' + \
         str(dist.get_rank()) + '.pt'
     os.makedirs(os.path.dirname(output_dir), exist_ok=True)
     booster.save_model(model,  output_dir, tp_degree=tp_degree)

@@ -59,7 +59,7 @@ def inference():
     tp_degree = 8
     dp_degree = 1
     # 0: by row (bs=8, peak_mem=28487 MB), -1: by col (bs=8, peak_mem=24855 MB)
-    dims = -1
+    dims = 0
     disable_existing_loggers()
     import transformers.models.llama.modeling_llama
     colossalai.launch_from_torch(config=dict(parallel=dict(data=dp_degree, pipeline=1,
@@ -71,7 +71,7 @@ def inference():
     default_dist_spec = ShardSpec([dims], [tp_degree])
 
     with ColoInitContext(device=get_current_device(), default_dist_spec=default_dist_spec, default_pg=shard_pg):
-        model_config = AutoConfig.from_pretrained("/home/ubuntu/gqa/llm/gqa_llama")
+        model_config = AutoConfig.from_pretrained("/home/ubuntu/GQA/llm/gqa_llama")
         # if 'llama-7b' in model_args.model_name_or_path:
         #     model = LlamaForCausalLM(model_config)
         # elif 'opt-6.7b' in model_args.model_name_or_path:
@@ -82,7 +82,7 @@ def inference():
         #   # torch_dtype=inference_args.inference_dtype,
         #   # device_map="auto",
         # )
-        model_config.update({"kv_h": 8})
+        # model_config.update({"kv_h": 32})
         model = transformers.AutoModelForCausalLM.from_config(model_config)
 
         generation_config = GenerationConfig(
@@ -145,6 +145,7 @@ def inference():
         ]:
             inputs = tokenizer(generate_prompt(
                 instruction, None), return_tensors="pt")
+            print(inputs['input_ids'].shape)
             dist.broadcast(inputs['input_ids'].cuda(), src=0)
             if dist.get_rank() == 0:
                 # logger.info("Instruction: {}".format(instruction), ranks=[0])
@@ -161,7 +162,7 @@ def inference():
                 # logger.info("Response: {}".format(tokenizer.decode(generated_tokens[0])), ranks=[0])
                 print("Response: {}".format(
                     tokenizer.decode(generated_tokens[0])))
-                print()
+                print(generated_tokens[0].shape)
             else:
                 model.generate(input_ids=inputs["input_ids"].cuda(),
                                generation_config=generation_config,

@@ -6,7 +6,7 @@ python3 -m torch.distributed.launch --nproc_per_node 8 --master_port=8888 --use-
     --data_path togethercomputer/RedPajama-Data-1T-Sample \
     --output_dir ./trained/temp2.pt \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 6 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --evaluation_strategy "no" \
