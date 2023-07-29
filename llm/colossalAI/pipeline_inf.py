@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+import sys
+sys.path.append("..")
 import GPUtil
 import numpy as np
 import torch
@@ -13,7 +15,6 @@ from colossalai.cluster import DistCoordinator
 import torch.distributed as dist
 from colossalai.logging import disable_existing_loggers, get_dist_logger
 import sys
-sys.path.append('..')
 
 from transformers import AutoConfig
 # LLaMA
@@ -23,7 +24,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 import transformers.models.opt.modeling_opt
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 
-from llama_train_colo import ModelArguments, smart_tokenizer_and_embedding_resize, DEFAULT_PAD_TOKEN, DEFAULT_EOS_TOKEN, \
+from train_taeho import ModelArguments, DEFAULT_PAD_TOKEN, DEFAULT_EOS_TOKEN, \
     DEFAULT_BOS_TOKEN, DEFAULT_UNK_TOKEN, PROMPT_DICT
 
 
@@ -71,24 +72,26 @@ def inference():
     default_dist_spec = ShardSpec([dims], [tp_degree])
 
     with ColoInitContext(device=get_current_device(), default_dist_spec=default_dist_spec, default_pg=shard_pg):
-        model_config = AutoConfig.from_pretrained("/home/ubuntu/GQA/llm/gqa_llama")
-        # if 'llama-7b' in model_args.model_name_or_path:
-        #     model = LlamaForCausalLM(model_config)
-        # elif 'opt-6.7b' in model_args.model_name_or_path:
-        #     model = OPTForCausalLM(model_config)
+        model_config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path)
+        model_config.update({"kv_h": 32})
+        if 'llama-7b' in model_args.model_name_or_path:
+            model = LlamaForCausalLM(model_config)
+        elif 'opt-6.7b' in model_args.model_name_or_path:
+            model = OPTForCausalLM(model_config)
         # model = transformers.AutoModelForCausalLM.from_pretrained(
         #   model_args.model_name_or_path,
         #   # load_in_8bit=inference_args.load_in_8bit,
         #   # torch_dtype=inference_args.inference_dtype,
         #   # device_map="auto",
         # )
-        # model_config.update({"kv_h": 32})
-        model = transformers.AutoModelForCausalLM.from_config(model_config)
+        model.cuda()
+        model.eval()
 
         generation_config = GenerationConfig(
             temperature=0.1,
             top_p=0.75,
-            num_beams=4,
+            # num_beams=4,
         )
 
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -119,10 +122,9 @@ def inference():
     if inference_args.override_checkpoint is not None:
         logger.info("Loading override checkpoint.", ranks=[0])
         try:
-            state_dict = torch.load(inference_args.override_checkpoint + str(dist.get_rank()) + '.pt')
+            state_dict = torch.load(
+                inference_args.override_checkpoint + str(dist.get_rank()) + '.pt')
             model.load_state_dict(state_dict)
-            pytorch_total_params = sum(p.numel() for p in model.parameters())
-            print("Param: {:.2f}".format(tp_degree * pytorch_total_params/1000/1000))
         except:
             raise Exception("Failed to load checkpoint")
         model.cuda()
@@ -130,47 +132,62 @@ def inference():
         model.eval()
 
         # ctx = ""
-        import time
-        start = time.time()
-        for instruction in [
-            "My name is Anna, and I ",
+        # for instruction in [
+        #     "Tell me about alpacas.",
+        #     "Tell me about the president of Mexico in 2019.",
+        #     "Tell me about the king of France in 2019.",
+        #     "List all Canadian provinces in alphabetical order.",
+        #     "Write a Python program that prints the first 10 Fibonacci numbers.",
+        #     "Write a program that prints the numbers from 1 to 100. But for multiples of three print 'Fizz' instead of the number and for the multiples of five print 'Buzz'. For numbers which are multiples of both three and five print 'FizzBuzz'.",
+        #     "Tell me five words that rhyme with 'shock'.",
+        #     "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
+        #     "Count up from 1 to 500.",
+        # ]:
+        instructions = [
+            # "Tell me about alpacas.",
             "Tell me about the president of Mexico in 2019.",
-            # "Tell me about the king of France in 2019.",
+            "Tell me about the king of France in 2019.",
             # "List all Canadian provinces in alphabetical order.",
             # "Write a Python program that prints the first 10 Fibonacci numbers.",
             # "Write a program that prints the numbers from 1 to 100. But for multiples of three print 'Fizz' instead of the number and for the multiples of five print 'Buzz'. For numbers which are multiples of both three and five print 'FizzBuzz'.",
             # "Tell me five words that rhyme with 'shock'.",
-            "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
-            # "Count up from 1 to 500.",
-        ]:
-            inputs = tokenizer(generate_prompt(
-                instruction, None), return_tensors="pt")
-            print(inputs['input_ids'].shape)
-            dist.broadcast(inputs['input_ids'].cuda(), src=0)
-            if dist.get_rank() == 0:
-                # logger.info("Instruction: {}".format(instruction), ranks=[0])
-                print("Instruction: {}".format(instruction))
-                outputs = model.generate(input_ids=inputs["input_ids"].cuda(),
-                                         generation_config=generation_config,
-                                         max_new_tokens=inference_args.model_max_length,
-                                         return_dict_in_generate=True,
-                                         output_scores=True)
-                input_length = 1 if model.config.is_encoder_decoder else inputs.input_ids.shape[1]
-                generated_tokens = outputs.sequences[:, input_length:]
-                print(print_rank_0('Used GPU mem: {0}'.format(GPUtil.getGPUs()[0].memoryUsed)))
-                # ctx += f"Instruction: {instruction}\n" + f"Response: {generated_tokens[0]}\n"
-                # logger.info("Response: {}".format(tokenizer.decode(generated_tokens[0])), ranks=[0])
-                print("Response: {}".format(
-                    tokenizer.decode(generated_tokens[0])))
-                print(generated_tokens[0].shape)
-            else:
-                model.generate(input_ids=inputs["input_ids"].cuda(),
-                               generation_config=generation_config,
-                               max_new_tokens=inference_args.model_max_length,
-                               return_dict_in_generate=True,
-                               output_scores=True)
-            print("time: {:.2f}".format(time.time()-start))
-            start = time.time()
+            # "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
+            # "Count up from 1 to 500."
+            ]
+        inputs = []
+        for i in instructions:
+            inp = tokenizer(generate_prompt(i, None), return_tensors="pt")["input_ids"]
+            inputs.append(inp)
+            # dist.broadcast(inp.cuda(), src=0)
+        max_len = max([i.shape[1] for i in inputs])
+        inputs = [torch.nn.functional.pad(x, pad=(0, max_len - x.numel()), mode='constant', value=0) for x in inputs]
+        inputs = torch.cat(inputs, dim=0)
+        dist.broadcast(inputs.cuda(), src=0)
+        if dist.get_rank() == 0:
+            # logger.info("Instruction: {}".format(instruction), ranks=[0])
+            # print("Instruction: {}".format(instruction))
+            outputs = model.generate(input_ids=inputs.cuda(),
+                                        generation_config=generation_config,
+                                        max_new_tokens=inference_args.model_max_length,
+                                        return_dict_in_generate=True,
+                                        output_scores=True)
+            # input_length = 1 if model.config.is_encoder_decoder else inputs.input_ids.shape[
+            #     1]
+            generated_tokens = outputs.sequences
+            print(print_rank_0('Used GPU mem: {0}'.format(GPUtil.getGPUs()[0].memoryUsed)))
+            # ctx += f"Instruction: {instruction}\n" + f"Response: {generated_tokens[0]}\n"
+            # logger.info("Response: {}".format(tokenizer.decode(generated_tokens[0])), ranks=[0])
+            print(generated_tokens.shape)
+            for i in range(generated_tokens.shape[0]):
+                print("Response: {}".format(tokenizer.decode(generated_tokens[i, :])))
+            # print()
+        else:
+            model.generate(input_ids=inputs.cuda(),
+                            generation_config=generation_config,
+                            max_new_tokens=inference_args.model_max_length,
+                            return_dict_in_generate=True,
+                            output_scores=True)
+
 
 if __name__ == "__main__":
     inference()

@@ -13,38 +13,39 @@
 #    limitations under the License.
 import sys
 sys.path.append('..')
-import psutil
-import GPUtil
-from statistics import mean
-from colossalai.core import global_context as gpc
-from colossalai.context import ParallelMode
-from colossalai.nn.parallel.layers import init_colo_module
-from colossalai.tensor import ProcessGroup, ShardSpec, ComputePattern, ComputeSpec
-from tqdm import tqdm
-import torch.distributed as dist
-from colossalai.pipeline.pipelinable import PipelinableContext
-from colossalai.cluster import DistCoordinator
-from colossalai.booster.plugin import GeminiPlugin, LowLevelZeroPlugin, TorchDDPPlugin, TorchFSDPPlugin
-from colossalai.booster import Booster
-from colossalai.zero import ColoInitContext, GeminiAdamOptimizer, zero_optim_wrapper
-from colossalai.utils import get_current_device, print_rank_0
-from colossalai.tensor import ProcessGroup, ShardSpec
-from colossalai.logging import disable_existing_loggers, get_dist_logger
-from colossalai.nn.optimizer import HybridAdam
-import colossalai
-from transformers import get_cosine_schedule_with_warmup
-from transformers import Trainer, DataCollatorForLanguageModeling, AutoConfig
-from datasets import load_dataset
-from torch.utils.data import Dataset
-import utils
-import transformers
-import torch
-import time
-from typing import Dict, Optional, Sequence
-from dataclasses import dataclass, field
-import logging
-import copy
+import math
 import os
+import copy
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Sequence
+import time
+import torch
+import transformers
+import utils
+from torch.utils.data import Dataset
+from datasets import load_dataset
+from transformers import Trainer, DataCollatorForLanguageModeling, AutoConfig
+from transformers import get_cosine_schedule_with_warmup, LlamaForCausalLM
+import colossalai
+from colossalai.nn.optimizer import HybridAdam
+from colossalai.logging import disable_existing_loggers, get_dist_logger
+from colossalai.tensor import ProcessGroup, ShardSpec
+from colossalai.utils import get_current_device, print_rank_0
+from colossalai.zero import ColoInitContext, GeminiAdamOptimizer, zero_optim_wrapper
+from colossalai.booster import Booster
+from colossalai.booster.plugin import GeminiPlugin, LowLevelZeroPlugin, TorchDDPPlugin, TorchFSDPPlugin
+from colossalai.cluster import DistCoordinator
+from colossalai.pipeline.pipelinable import PipelinableContext
+import torch.distributed as dist
+from tqdm import tqdm
+from colossalai.tensor import ProcessGroup, ShardSpec, ComputePattern, ComputeSpec
+from colossalai.nn.parallel.layers import init_colo_module
+from colossalai.context import ParallelMode
+from colossalai.core import global_context as gpc
+from statistics import mean
+import GPUtil
+import psutil
 
 
 # from titans.model.vit.vit import _create_vit_model
@@ -56,7 +57,7 @@ def move_to_cuda(batch, device):
     return {k: v.to(device) for k, v in batch.items()}
 
 
-def train_epoch(epoch, model, optimizer, lr_scheduler, dataloader, booster, coordinator):
+def train_epoch(epoch, model, optimizer, lr_scheduler, dataloader, booster, coordinator, output_dir, tp_degree):
     print_rank_0('[3]Used GPU mem: {0}'.format(
         GPUtil.getGPUs()[0].memoryUsed))  # 32077 MB
     print_rank_0('[3]Virtual used mem: {0}'.format(
@@ -71,7 +72,7 @@ def train_epoch(epoch, model, optimizer, lr_scheduler, dataloader, booster, coor
             # Forward
             # optimizer.zero_grad()
             # print(dist.get_rank())
-            
+
             batch = move_to_cuda(batch, torch.cuda.current_device())
             outputs = model(use_cache=False, **batch)
             # print_rank_0("cccccccccc")
@@ -85,9 +86,9 @@ def train_epoch(epoch, model, optimizer, lr_scheduler, dataloader, booster, coor
             pbar.set_postfix(
                 {'loss': loss.item(), 'Memory usage': GPUtil.getGPUs()[0].memoryUsed})
             losses.append(loss.item())
-            steps+=1
-            if steps >= 50:
-                break
+            steps += 1
+            if steps % 500 == 0:
+                booster.save_model(model,  output_dir, tp_degree=tp_degree)
 
     print_rank_0('Average loss of epoch {0}: {1:.2f}, Memory usage: {2}'.format(
         epoch + 1, mean(losses), GPUtil.getGPUs()[0].memoryUsed))
@@ -132,133 +133,8 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={
             "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-
-
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(
-        special_tokens_dict)  # special_tokens_dict = {'pad_token': '[PAD]'}
-    model.resize_token_embeddings(len(tokenizer))
-
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-
-                                                num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-
-                                                  num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
-
-
-def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
-    """Tokenize a list of strings."""
-    tokenized_list = [
-        tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        )
-        for text in strings
-    ]
-    input_ids = labels = [tokenized.input_ids[0]
-                          for tokenized in tokenized_list]
-    input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
-    ]
-    return dict(
-        input_ids=input_ids,
-        labels=labels,
-        input_ids_lens=input_ids_lens,
-        labels_lens=labels_lens,
-    )
-
-
-def preprocess(
-    sources: Sequence[str],
-    targets: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Preprocess the data by tokenizing."""
-    examples = [s + t for s, t in zip(sources, targets)]
-    examples_tokenized, sources_tokenized = [_tokenize_fn(
-        strings, tokenizer) for strings in (examples, sources)]
-    input_ids = examples_tokenized["input_ids"]
-    labels = copy.deepcopy(input_ids)
-    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len] = IGNORE_INDEX
-    return dict(input_ids=input_ids, labels=labels)
-
-
-class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
-
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
-        super(SupervisedDataset, self).__init__()
-        logging.warning("Loading data...")
-        list_data_dict = utils.jload(data_path)
-
-        logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        sources = [
-            prompt_input.format_map(example) if example.get(
-                "input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
-        targets = [
-            f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
-
-        logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
-
-        self.input_ids = data_dict["input_ids"]
-        self.labels = data_dict["labels"]
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        return dict(input_ids=self.input_ids[i], labels=self.labels[i])
-
-
-@dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
-    tokenizer: transformers.PreTrainedTokenizer
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple(
-            [instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=IGNORE_INDEX)
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
-
-
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(
-        tokenizer=tokenizer, data_path=data_args.data_path)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    do_eval: bool = field(default=False)
+    do_train: bool = field(default=True)
 
 
 def get_size(bytes, suffix="B"):
@@ -274,16 +150,16 @@ def get_size(bytes, suffix="B"):
 
 def train():
     tp_degree = 8
+    dp_degree = 1
+    # 0: by row (bs=8, peak_mem=28487 MB), -1: by col (bs=8, peak_mem=24855 MB)
     dims = 0
-    # for LLaMA models
-    import transformers.models.llama.modeling_llama
+    kv_h = 8
     # Launch ColossalAI
     # colossalai.launch_from_torch(config={}, seed=0)
-    colossalai.launch_from_torch(config=dict(parallel=dict(
-        data=1, pipeline=1, tensor=dict(size=tp_degree, mode='1d'))))
+    colossalai.launch_from_torch(config=dict(parallel=dict(data=dp_degree, pipeline=1,
+                                                           tensor=dict(size=tp_degree, mode='1d'))))
     coordinator = DistCoordinator()
     world_size = coordinator.world_size
-    shard_pg = ProcessGroup(tp_degree=tp_degree)
     # Manage loggers
     disable_existing_loggers()
     logger = get_dist_logger()
@@ -293,33 +169,24 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # with PipelinableContext():
-    default_dist_spec = ShardSpec([dims], [tp_degree])
-    model_config = AutoConfig.from_pretrained(model_args.model_name_or_path)
 
-    model_config.update({"kv_h": 16})
-    model_config.save_pretrained("gqa_llama")
+    shard_pg = ProcessGroup(tp_degree=tp_degree)
+    default_dist_spec = ShardSpec([dims], [tp_degree])
 
     with ColoInitContext(device=get_current_device(), default_dist_spec=default_dist_spec, default_pg=shard_pg):
-        # with ColoInitContext(device=get_current_device()):
-        # from transformers import LlamaConfig
-        # configuration = LlamaConfig(vocab_size=31999)
-        print_rank_0('[0]Used GPU mem: {0}'.format(
-            GPUtil.getGPUs()[0].memoryUsed))  # 1421 MB
-        print_rank_0('[0]Virtual total mem: {0}'.format(
-            get_size(psutil.virtual_memory().total)))  # 1.10 TB
-        print_rank_0('[0]Virtual used mem: {0}'.format(
-            get_size(psutil.virtual_memory().used)))  # 14.55 GB
-        # model = transformers.AutoModelForCausalLM.from_pretrained(
-        #     model_args.model_name_or_path,
-        #     cache_dir=training_args.cache_dir,
-        #     ignore_mismatched_sizes=True,
-        # ) #.to('cuda')
+        model_config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path)
 
-        model = transformers.AutoModelForCausalLM.from_config(model_config)
-        model.gradient_checkpointing_enable()
+        model_config.update({"kv_h": kv_h})
+        # model_config.save_pretrained("gqa_llama")
+        if 'llama-7b' in model_args.model_name_or_path:
+            model = LlamaForCausalLM(model_config)
+        elif 'llama-65b' in model_args.model_name_or_path:
+            model = LlamaForCausalLM(model_config)
         pytorch_total_params = sum(p.numel() for p in model.parameters())
         print("Param: {:.2f}".format(
             tp_degree * pytorch_total_params/1000/1000))
+        model.gradient_checkpointing_enable()
 
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -348,10 +215,8 @@ def train():
         # )
         # data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
         data_module = load_dataset(data_args.data_path)
-        data_module["train"] = load_dataset(
-            data_args.data_path, split="train[:1%]")
-        data_module = utils.dataset_mapping(
-            tokenizer, data_module, max_seq_length=2048)
+        data_module["train"] = load_dataset(data_args.data_path, split="train[:1%]")
+        data_module = utils.dataset_mapping(tokenizer, data_module, max_seq_length=2048)
         # 27189 MB // When sharding in with ColoInitContext 5525 MB
         print_rank_0('[1]Used GPU mem: {0}'.format(
             GPUtil.getGPUs()[0].memoryUsed))
@@ -364,13 +229,13 @@ def train():
         "/home/ubuntu/.cache/huggingface/hub/models--huggyllama--llama-7b/snapshots/8416d3fefb0cb3ff5775a7b13c1692d10ff1aa16/model-00001-of-00002.safetensors"))
     pretrained_state.update(load_file(
         "/home/ubuntu/.cache/huggingface/hub/models--huggyllama--llama-7b/snapshots/8416d3fefb0cb3ff5775a7b13c1692d10ff1aa16/model-00002-of-00002.safetensors"))
-    
+
     # for n, p in pretrained_state.items():
     #     with open("1.txt", "a") as f:
-    #         f.writelines(str(n) + " " + str(p.shape) + "\n")  
+    #         f.writelines(str(n) + " " + str(p.shape) + "\n")
     for n, p in model.named_parameters():
         with open(f"row_gqa_{model_config.kv_h}.txt", "a") as f:
-        # print(list(pretrained_state.keys())[i], list(pretrained_state.values())[i].shape)
+            # print(list(pretrained_state.keys())[i], list(pretrained_state.values())[i].shape)
             f.writelines(str(n) + " " + str(p.shape) + "\n")
     # sys.exit()
 
@@ -449,20 +314,81 @@ def train():
     #     sys.exit()
 
     # Start finetuning
-    logger.info(f"Start finetuning", ranks=[0])
-    start = time.time()
-    for epoch in range(config['epochs']):
-        train_epoch(epoch, model, optimizer, lr_scheduler,
-                    dataloader, booster, coordinator)
-    logger.info(f"Finish finetuning, time:{time.time()-start}", ranks=[0])
+    if training_args.do_train:
+        logger.info(f"Start finetuning", ranks=[0])
+        output_dir = f'/home/ubuntu/GQA/trained/hellaswag_gqa_{model_config.kv_h}_shard_colo_llama-7b/' + str(
+            dist.get_rank()) + '.pt'
+        os.makedirs(os.path.dirname(output_dir), exist_ok=True)
+        start = time.time()
+        for epoch in range(config['epochs']):
+            train_epoch(epoch, model, optimizer, lr_scheduler,
+                        dataloader, booster, coordinator, output_dir, tp_degree)
+        logger.info(f"Finish finetuning, time:{time.time()-start}", ranks=[0])
 
-    output_dir = f'/home/ubuntu/GQA/trained/gqa_{model_config.kv_h}_shard_colo_llama-7b/' + \
-        str(dist.get_rank()) + '.pt'
-    os.makedirs(os.path.dirname(output_dir), exist_ok=True)
-    booster.save_model(model,  output_dir, tp_degree=tp_degree)
-    # print(output_dir)
-    # Finish training and evaluate
-    
+        booster.save_model(model,  output_dir, tp_degree=tp_degree)
+
+    if training_args.do_eval:
+        with ColoInitContext(device=get_current_device(), default_dist_spec=default_dist_spec, default_pg=shard_pg):
+            model_config = AutoConfig.from_pretrained(
+                model_args.model_name_or_path)
+            model_config.update({"kv_h": 32})
+            if 'llama-7b' in model_args.model_name_or_path:
+                model = LlamaForCausalLM(model_config)
+
+            model.cuda()
+            model.eval()
+
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                use_fast=False,
+                model_max_length=512,
+            )
+
+            if tokenizer.pad_token is None:
+                # For size matching of Colossal-AI
+                tokenizer.pad_token = tokenizer.eos_token
+
+            tokenizer.add_special_tokens(
+                {
+                    "eos_token": DEFAULT_EOS_TOKEN,
+                    "bos_token": DEFAULT_BOS_TOKEN,
+                    "unk_token": DEFAULT_UNK_TOKEN,
+                }
+            )
+        compute_spec = ComputeSpec(ComputePattern.TP1D)
+        init_colo_module(model, compute_spec, pg=shard_pg, recursive=True)
+        state_dict = torch.load(
+            "/home/ubuntu/GQA/trained/test_gqa_32_shard_colo_llama-7b/" + str(dist.get_rank()) + '.pt')
+        model.load_state_dict(state_dict)
+
+        training_args = TrainingArguments(
+            output_dir="test_group_{}_checkpoint".format(model_config.kv_h),
+            evaluation_strategy="steps",
+            weight_decay=0.01,
+            # bf16=True,
+            fp16=True,
+            do_eval=False,
+            per_device_train_batch_size=2,
+            # learning_rate=learning_rate,
+            max_steps=500,
+            seed=0,
+            push_to_hub=False,
+            adam_beta2=0.98,
+            remove_unused_columns=False,
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            # train_dataset=tokenized_datasets["train"],
+            eval_dataset=data_module["test"],
+            data_collator=data_collator,
+        )
+
+        # trainer.save_model("roberta_hf")
+        eval_results = trainer.evaluate()
+        print(
+            f"Perplexity: {math.exp(eval_results['eval_loss']):.2f}, samples_per_sec: {eval_results['eval_samples_per_second']}")
 
 
 if __name__ == "__main__":

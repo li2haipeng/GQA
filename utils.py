@@ -27,7 +27,7 @@ def jload(f, mode="r"):
 
 def dataset_mapping(trained_tokenizer, raw_dataset, max_seq_length):
     def tokenize_function(examples):
-        return trained_tokenizer(examples["text"], return_special_tokens_mask=True, truncation=True, max_length=max_seq_length)
+        return trained_tokenizer(examples["ctx"], return_special_tokens_mask=True, truncation=True, max_length=max_seq_length)
     
     def group_texts(examples):
         concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
