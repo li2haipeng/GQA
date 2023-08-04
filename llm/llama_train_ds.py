@@ -22,7 +22,8 @@ import torch
 import transformers
 import utils
 from torch.utils.data import Dataset
-from transformers import Trainer, AutoConfig, LlamaForCausalLM
+from transformers import Trainer, AutoConfig, DataCollatorForLanguageModeling
+from flash_attn_llama.modeling_flash_llama import LlamaForCausalLM
 from datasets import load_dataset
 import torch.distributed as dist
 import GPUtil
@@ -133,28 +134,37 @@ def train():
     )
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
+        # special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
+        tokenizer.add_special_tokens({'pad_token': DEFAULT_PAD_TOKEN})
     if tokenizer.eos_token is None:
-        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
+        # special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
+        tokenizer.add_special_tokens({'eos_token': DEFAULT_EOS_TOKEN})
     if tokenizer.bos_token is None:
-        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
+        # special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
+        tokenizer.add_special_tokens({'bos_token': DEFAULT_BOS_TOKEN})
     if tokenizer.unk_token is None:
-        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+        # special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+        tokenizer.add_special_tokens({'unk_token': DEFAULT_UNK_TOKEN})
 
 
     if dist.get_rank() == 0:
         print('[1]Used GPU mem: {0}'.format(GPUtil.getGPUs()[0].memoryUsed))    # ZeRO-3: 5449 MB, ZeRO-2: 27625 MB
         print('[1]Virtual used mem: {0}'.format(get_size(psutil.virtual_memory().used))) # 5.65 GB
 
-    data_module = load_dataset(data_args.data_path)
-    data_module["train"] = load_dataset(data_args.data_path, split="train[1%:10%]")
-    data_module["validation"] = load_dataset(data_args.data_path, split="train[:1%]")
-    data_module = utils.dataset_mapping(tokenizer, data_module, max_seq_length=2048)
+    raw_dataset = load_dataset("wikipedia", "20220301.en")
+    raw_dataset["train"] = load_dataset("wikipedia", "20220301.en", split="train[1%:10%]").select(range(10000))
+    #raw_dataset["train"] = raw_dataset["train"].select(range(10000))
+    # raw_dataset["validation"] = load_dataset("wikipedia", "20220301.en", split="train[:1%]")
+    data_module = utils.dataset_mapping(tokenizer, raw_dataset, max_seq_length=2048)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     if dist.get_rank() == 0:
         print('[2]Used GPU mem: {0}'.format(GPUtil.getGPUs()[0].memoryUsed)) # ZeRO-3: 5394 MB, ZeRO-2: 27625 MB
         print('[2]Virtual used mem: {0}'.format(get_size(psutil.virtual_memory().used))) # 18.11 GB
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, 
+                      train_dataset=data_module["train"], 
+                    #   eval_dataset=data_module["validation"], 
+                      data_collator=data_collator)
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
