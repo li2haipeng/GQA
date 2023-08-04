@@ -79,6 +79,8 @@ class TrainingArguments(transformers.TrainingArguments):
     push_to_hub=False,
     # adam_beta2=0.98,
     remove_unused_columns=False,
+    report_to="wandb",
+
 
 
 
