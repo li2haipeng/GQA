@@ -336,6 +336,8 @@ class FlashLlamaAttention(nn.Module):
         
         kv_states = torch.stack([key_states.transpose(1, 2), value_states.transpose(1, 2)], dim=2)
         attn_output, _, attn_weights = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, dropout_p=0.1, return_attn_probs=True)
+        # attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states)
+
         # print(attn_output.shape, attn_weights.dtype)
         attn_output = attn_output.transpose(1, 2)
         # attn_weights = None

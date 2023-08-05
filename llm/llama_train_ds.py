@@ -22,7 +22,7 @@ import torch
 import transformers
 import utils
 from torch.utils.data import Dataset
-from transformers import Trainer, AutoConfig, DataCollatorForLanguageModeling
+from transformers import Trainer, AutoConfig, DataCollatorForLanguageModeling, AutoModelForCausalLM
 from flash_attn_llama.modeling_flash_llama import LlamaForCausalLM
 from datasets import load_dataset
 import torch.distributed as dist
@@ -110,8 +110,11 @@ def train():
     model_config.update({"kv_h": kv_h})
 
     model = LlamaForCausalLM(model_config)
+    # from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+    # model = load_state_dict_from_zero_checkpoint(model, "/home/ubuntu/GQA/trained/DS_llama/checkpoint-1400")
     pytorch_total_params = sum(p.numel() for p in model.parameters())
     print("Param: {:.2f}".format(pytorch_total_params/1000/1000))
+
     model.gradient_checkpointing_enable()   ###
     state_dict = {}
       
@@ -154,9 +157,8 @@ def train():
         print('[1]Virtual used mem: {0}'.format(get_size(psutil.virtual_memory().used))) # 5.65 GB
 
     raw_dataset = load_dataset("wikipedia", "20220301.en")
-    raw_dataset["train"] = load_dataset("wikipedia", "20220301.en", split="train[1%:10%]").select(range(10000))
-    #raw_dataset["train"] = raw_dataset["train"].select(range(10000))
-    # raw_dataset["validation"] = load_dataset("wikipedia", "20220301.en", split="train[:1%]")
+    raw_dataset["train"] = load_dataset("wikipedia", "20220301.en", split="train[1%:10%]")
+    raw_dataset["validation"] = load_dataset("wikipedia", "20220301.en", split="train[:1%]")
     data_module = utils.dataset_mapping(tokenizer, raw_dataset, max_seq_length=2048)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -165,13 +167,12 @@ def train():
         print('[2]Virtual used mem: {0}'.format(get_size(psutil.virtual_memory().used))) # 18.11 GB
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, 
                       train_dataset=data_module["train"], 
-                    #   eval_dataset=data_module["validation"], 
+                      eval_dataset=data_module["validation"], 
                       data_collator=data_collator)
     trainer.train()
-    trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
     eval_results = trainer.evaluate()
     print(f"Perplexity: {math.exp(eval_results['eval_loss']):.2f}, samples_per_sec: {eval_results['eval_samples_per_second']}")
+
 
 
 if __name__ == "__main__":

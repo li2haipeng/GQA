@@ -27,17 +27,17 @@ python3 -m torch.distributed.launch --nproc_per_node=8 --master_port=8888 --use-
     --kv_h 8 \
     --bf16 True \
     --output_dir /home/ubuntu/GQA/trained/DS_llama \
-    --num_train_epochs 20 \
+    --max_steps 100 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 4 \
-    --evaluation_strategy "no" \
+    --evaluation_strategy "steps" \
     --save_strategy "steps" \
-    --save_steps 200 \
+    --save_steps 50 \
     --save_total_limit 1 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
-    --logging_steps 5 \
+    --logging_steps 50 \
     --deepspeed ds_config.json
