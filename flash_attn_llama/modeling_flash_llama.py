@@ -335,35 +335,34 @@ class FlashLlamaAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
         
         kv_states = torch.stack([key_states.transpose(1, 2), value_states.transpose(1, 2)], dim=2)
-        attn_output, _, attn_weights = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, dropout_p=0.1, return_attn_probs=True)
-        # attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states)
+        # attn_output, _, attn_weights = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, dropout_p=0.1, return_attn_probs=True)
+        attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states)
 
-        # print(attn_output.shape, attn_weights.dtype)
         attn_output = attn_output.transpose(1, 2)
-        # attn_weights = None
+
+
+        attn_weights = None
         # attn_weights = attn_weights.transpose(1, 2)
 
-        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+        if attn_weights is not None:
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # attn_output = torch.matmul(attn_weights, value_states)
+            
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask
+                attn_weights = torch.max(
+                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+                )
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+ 
         
         
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):

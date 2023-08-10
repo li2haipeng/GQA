@@ -21,17 +21,16 @@ export WANDB_MODE=online
 #     --logging_steps 5 \
 #     --deepspeed ds_config.json
 
-
-python3 -m torch.distributed.launch --nproc_per_node=8 --master_port=8888 --use-env llama_train_ds.py \
+torchrun --nproc_per_node=8 llama_train_ds.py \
     --model_name_or_path huggyllama/llama-7b \
     --kv_h 8 \
     --bf16 True \
-    --output_dir /home/ubuntu/GQA/trained/DS_llama \
+    --output_dir /home/ubuntu/GQA/trained/DS_llama_8 \
     --max_steps 100 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 4 \
-    --evaluation_strategy "steps" \
+    --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 50 \
     --save_total_limit 1 \
@@ -39,5 +38,6 @@ python3 -m torch.distributed.launch --nproc_per_node=8 --master_port=8888 --use-
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
-    --logging_steps 50 \
-    --deepspeed ds_config.json
+    --logging_steps 10 \
+    --deepspeed ds_config.json \
+    --run_name flash_8

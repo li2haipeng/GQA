@@ -51,7 +51,7 @@ PROMPT_DICT = {
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    model_name_or_path: Optional[str] = field(default="huggyllama/llama-7b")
     kv_h: int = field(default=32)
 
 
@@ -64,25 +64,13 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=512,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
     evaluation_strategy="steps",
-    # weight_decay=0.01,
-    # bf16=True,
     fp16=True,
-    # per_device_train_batch_size=2,
-    # learning_rate=learning_rate,
-    max_steps=2000,
     seed=0,
     push_to_hub=False,
-    # adam_beta2=0.98,
     remove_unused_columns=False,
     report_to="wandb",
-
-
-
+    model_max_length = 2048
 
 
 def get_size(bytes, suffix="B"):
@@ -159,7 +147,7 @@ def train():
     raw_dataset = load_dataset("wikipedia", "20220301.en")
     raw_dataset["train"] = load_dataset("wikipedia", "20220301.en", split="train[1%:10%]")
     raw_dataset["validation"] = load_dataset("wikipedia", "20220301.en", split="train[:1%]")
-    data_module = utils.dataset_mapping(tokenizer, raw_dataset, max_seq_length=2048)
+    data_module = utils.dataset_mapping(tokenizer, raw_dataset, max_seq_length=training_args.model_max_length)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     if dist.get_rank() == 0:
@@ -170,8 +158,8 @@ def train():
                       eval_dataset=data_module["validation"], 
                       data_collator=data_collator)
     trainer.train()
-    eval_results = trainer.evaluate()
-    print(f"Perplexity: {math.exp(eval_results['eval_loss']):.2f}, samples_per_sec: {eval_results['eval_samples_per_second']}")
+    # eval_results = trainer.evaluate()
+    # print(f"Perplexity: {math.exp(eval_results['eval_loss']):.2f}, samples_per_sec: {eval_results['eval_samples_per_second']}")
 
 
 
