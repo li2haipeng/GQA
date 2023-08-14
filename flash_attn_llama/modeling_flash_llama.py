@@ -20,12 +20,12 @@
 """ PyTorch LLaMA model."""
 import math
 from typing import List, Optional, Tuple, Union
-
+import sys
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+import time
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -214,7 +214,10 @@ class LlamaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-        
+        # print(query_states.size(), key_states.size(), value_states.size())
+        # print(key_states[:4].shape, key_states[4:8].shape)
+        # print(torch.equal(key_states[:4], key_states[4:8]))
+        # sys.exit()
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -231,15 +234,17 @@ class LlamaAttention(nn.Module):
 
         key_states = repeat_kv(key_states, n_rep=self.n_rep)
         value_states = repeat_kv(value_states, n_rep=self.n_rep)
-
+        t0 = time.time()
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        print("weight", attn_weights.size())
+        # with open("debug.txt", "a") as f:
+        #     f.write("{},{},{}\n".format(time.time()-t0, query_states.shape, key_states.shape))
+        # sys.exit()
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
-        # print("!!!!!!!!!", attention_mask)
+
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
@@ -253,8 +258,9 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         # attn_weights = self.dropout(attn_weights)
+        t1 = time.time()
         attn_output = torch.matmul(attn_weights, value_states)
-        print("output", attn_output.size())
+        # print("t2", time.time()-t1)
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -383,148 +389,13 @@ class FlashLlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class BifurcatedLlamaAttention(nn.Module):
-    """Bifurcated attention from sciense team"""
-
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.kv_h = config.kv_h
-        self.n_rep = config. num_attention_heads // config.kv_h
-        self.max_position_embeddings = config.max_position_embeddings
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
-        self.dropout = nn.Dropout(0.1)
-
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-        
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # [bsz, nh, t, hd]
-
-        key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        value_states = repeat_kv(value_states, n_rep=self.n_rep)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention, kv_h == h after repeat_kv
-            # print("1", past_key_value[0].shape, past_key_value[1].shape)
-            # attn_weights_context = torch.einsum("bhnk, ihkm -> bhnm", query_states, past_key_value[0].transpose(-2, -1))
-            # attn_weights_incremental = torch.einsum("bhnk, bhkm -> bhnm", query_states, key_states.transpose(-2, -1))
-
-            attn_weights_context = torch.matmul(query_states, past_key_value[0].transpose(2, 3))
-            attn_weights_incremental = torch.matmul(query_states, key_states.transpose(2, 3))
-            attn_weights = torch.cat([attn_weights_context, attn_weights_incremental], dim=-1) / math.sqrt(self.head_dim)
-
-            # print("1", attn_weights_context.shape, attn_weights_incremental.shape, attn_weights.shape)
-            # key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            # value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        # past_key_value = (key_states, value_states) if use_cache else None
-       
-        else:
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # print("weight", attn_weights.size())
-        # key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        # value_states = repeat_kv(value_states, n_rep=self.n_rep)
-
-            
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        # print("!!!!!!!!!", attention_mask)
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        if past_key_value is not None:
-            # print("1", past_key_value[0].shape, past_key_value[1].shape)
-            context_past_value_len = past_key_value[1].size()[-2]
-            # attn_output_context = torch.einsum("bhnm, ihmv -> bhnv", attn_weights[:, :, :, :context_past_value_len], past_key_value[1])
-            # attn_out_incremental = torch.einsum("bhnm, bhmv -> bhnv", attn_weights[:, :, :, context_past_value_len:], value_states)
-            attn_output_context = torch.matmul(attn_weights[:, :, :, :context_past_value_len], past_key_value[1])
-            attn_out_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
-            attn_output = attn_output_context + attn_out_incremental
-            # print("2", attn_output_context.shape, attn_out_incremental.shape, attn_output.shape)
-        else:
-            attn_output = torch.matmul(attn_weights, value_states)
-        # print("out", attn_output.size())
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
-
-        if past_key_value is not None:
-            past_key = torch.cat([past_key_value[0], key_states], dim=2)
-            past_value = torch.cat([past_key_value[1], value_states], dim=2)
-            # print("3", past_key.shape, past_value.shape)
-            past_key_value = (past_key, past_value) if use_cache else None
-        else:
-            past_key_value = (key_states, value_states) if use_cache else None
-
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        # self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config)
         # self.self_attn = FlashLlamaAttention(config=config)
-        self.self_attn = BifurcatedLlamaAttention(config=config)
+
         # print("we are using:", self.self_attn.__class__)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
