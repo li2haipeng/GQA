@@ -31,7 +31,7 @@ generation_config = GenerationConfig(
 )
 
 ds_engine = deepspeed.init_inference(model,
-                                 mp_size=1,
+                                 mp_size=8,
                                  dtype=torch.half,
                                  replace_with_kernel_inject=True)
 model = ds_engine.module
