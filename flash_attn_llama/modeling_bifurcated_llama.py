@@ -214,32 +214,46 @@ class BifurcatedLlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
         
         kv_seq_len = key_states.shape[-2]
+
         if past_key_value is not None:
-            if past_key_value[0]["incremental"] is not None:
-                add_len = past_key_value[0]["context"].shape[-2] + past_key_value[0]["incremental"].shape[-2]        
+            if past_key_value[0][1] is not None:
+                add_len = past_key_value[0][0].shape[-2] + past_key_value[0][1].shape[-2]        
             else:
-                add_len = past_key_value[0]["context"].shape[-2]
+                add_len = past_key_value[0][0].shape[-2]
             kv_seq_len += add_len
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
-        key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        value_states = repeat_kv(value_states, n_rep=self.n_rep)
-        
+        # key_states = repeat_kv(key_states, n_rep=self.n_rep)
+        # value_states = repeat_kv(value_states, n_rep=self.n_rep)
+        if self.kv_h != self.num_heads and self.kv_h != 1:
+            chunk_q = torch.chunk(query_states, self.n_rep, dim=1)
+            
         if past_key_value is not None:
-            if past_key_value[0]["incremental"] is not None:
-                key_states = torch.cat([past_key_value[0]["incremental"], key_states], dim=2)
-            past_key_value[0]["incremental"] = key_states
-            t0 = time.time()
-            attn_weights_context = torch.matmul(query_states, past_key_value[0]["context"][0].transpose(-2, -1))
-            attn_weights_incremental = torch.matmul(query_states, key_states.transpose(2, 3))
+
+            if past_key_value[0][1] is not None:
+                key_states = torch.cat([past_key_value[0][1], key_states], dim=2)
+            past_key_value[0][1] = key_states
+
+
+            if self.kv_h != self.num_heads and self.kv_h != 1:
+                # print(chunk_q[0].size(), past_key_value[0][0][0].size())
+                chunk_w_contxt = [torch.matmul(q, past_key_value[0][0][0].transpose(-2,-1)) for q in chunk_q]
+                attn_weights_context = torch.cat(chunk_w_contxt, dim=1)
+                chunk_w = [torch.matmul(q, key_states.transpose(2, 3)) for q in chunk_q]
+                attn_weights_incremental = torch.cat(chunk_w, dim=1)
+            else:
+                attn_weights_context = torch.matmul(query_states, past_key_value[0][0][0].transpose(-2, -1))
+                attn_weights_incremental = torch.matmul(query_states, key_states.transpose(2, 3))
             attn_weights = torch.cat([attn_weights_context, attn_weights_incremental], dim=-1) / math.sqrt(self.head_dim)
-            # with open("debug_bi.txt", "a") as f:
-            #     f.write("{},{},{},{}\n".format(time.time()-t0, query_states.shape, past_key_value[0]["context"][0].shape, key_states.shape))
             
         else:
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if self.kv_h != self.num_heads and self.kv_h != 1:
+                chunk_w = [torch.matmul(q, key_states.transpose(2, 3)) for q in chunk_q]
+                attn_weights = torch.cat(chunk_w, dim=1) / math.sqrt(self.head_dim)
+            else:
+                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
     
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -260,23 +274,37 @@ class BifurcatedLlamaAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        
+
+
         if past_key_value is not None:
-            if past_key_value[1]["incremental"] is not None:
-                value_states = torch.cat([past_key_value[1]["incremental"], value_states], dim=2)
-            past_key_value[1]["incremental"] = value_states
-            context_past_value_len = past_key_value[1]["context"].size()[-2]
-            t1 = time.time()
-            attn_output_context = torch.matmul(attn_weights[:, :, :, :context_past_value_len], past_key_value[1]["context"][0])
-            attn_out_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
+
+            if past_key_value[1][1] is not None:
+                value_states = torch.cat([past_key_value[1][1], value_states], dim=2)
+            past_key_value[1][1] = value_states
+            context_past_value_len = past_key_value[1][0].size()[-2]
+            if self.kv_h != self.num_heads and self.kv_h != 1:
+                chunk_w_contxt = torch.chunk(attn_weights[:, :, :, :context_past_value_len], self.n_rep, dim=1)               
+                chunk_w = torch.chunk(attn_weights[:, :, :, context_past_value_len:], self.n_rep, dim=1)
+
+                chunk_o_contxt = [torch.matmul(w_c, past_key_value[1][0][0]) for w_c in chunk_w_contxt]
+                attn_output_context = torch.cat(chunk_o_contxt, dim=1)
+                chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
+                attn_out_incremental = torch.cat(chunk_o, dim=1)
+            else:
+                attn_output_context = torch.matmul(attn_weights[:, :, :, :context_past_value_len], past_key_value[1][0][0])
+                attn_out_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
+
             attn_output = attn_output_context + attn_out_incremental
-            # print("t1", time.time()-t1)
-            # print("2", attn_output_context.shape, attn_out_incremental.shape, attn_output.shape)
+
         else:
-            attn_output = torch.matmul(attn_weights, value_states)
+            if self.kv_h != self.num_heads and self.kv_h != 1:
+                chunk_w = torch.chunk(attn_weights, self.n_rep, dim=1)
+                chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
+                attn_output = torch.cat(chunk_o, dim=1)
+            else:
+                attn_output = torch.matmul(attn_weights, value_states)
         
-        
-        # print("out", attn_output.size())
+
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -291,12 +319,12 @@ class BifurcatedLlamaAttention(nn.Module):
             # print("3", past_key.shape, past_value.shape)
             past_key_value = (past_key_value[0], past_key_value[1]) if use_cache else None
         else:
-            key = {}
-            value = {}
-            key["context"] = key_states
-            value["context"] = value_states
-            key["incremental"] = None
-            value["incremental"] = None
+            key = [[],[]]
+            value = [[],[]]
+            key[0] = key_states
+            value[0] = value_states
+            key[1] = None
+            value[1] = None
 
             past_key_value = (key, value) if use_cache else None
 
@@ -576,11 +604,16 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values_length = 0
 
         if past_key_values is not None:
-            if past_key_values[0][0]["incremental"] is not None:
-                past_key_values_length = past_key_values[0][0]["context"].shape[2] + past_key_values[0][0]["incremental"].shape[2]
+            # if past_key_values[0][0]["incremental"] is not None:
+            #     past_key_values_length = past_key_values[0][0]["context"].shape[2] + past_key_values[0][0]["incremental"].shape[2]
+            #     # print(past_key_values[0][0]["context"].shape, past_key_values[0][0]["incremental"].shape)
+            # else:
+            #     past_key_values_length = past_key_values[0][0]["context"].shape[2]
+            if past_key_values[0][0][1] is not None:
+                past_key_values_length = past_key_values[0][0][0].shape[2] + past_key_values[0][0][1].shape[2]
                 # print(past_key_values[0][0]["context"].shape, past_key_values[0][0]["incremental"].shape)
             else:
-                past_key_values_length = past_key_values[0][0]["context"].shape[2]
+                past_key_values_length = past_key_values[0][0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:

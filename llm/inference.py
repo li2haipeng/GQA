@@ -31,7 +31,7 @@ generation_config = GenerationConfig(
 )
 
 ds_engine = deepspeed.init_inference(model,
-                                 mp_size=8,
+                                 mp_size=1,
                                  dtype=torch.half,
                                  replace_with_kernel_inject=True)
 model = ds_engine.module
@@ -66,41 +66,39 @@ instructions = [
     # "Tell me five words that rhyme with 'shock'.",
     # "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
     # "Count up from 1 to 500."
-    ] *5
+    ] 
 
-instructions = ["".join(instructions)] * 256
+instructions = ["".join(instructions)] * 128
 # print(instructions)
 
 inputs = tokenizer(instructions, return_tensors="pt", padding=True)["input_ids"]
 
-t0 = time.time()
+
 interations = 3
 print("start...")
 for i in range(interations):
+    t0 = time.time()
     print("run:", i)
-    t00 = time.time()
+
     outputs = model.generate(input_ids=inputs.cuda(),
                                     generation_config=generation_config,
                                     max_new_tokens=256,
                                     pad_token_id=tokenizer.eos_token_id)
-    # print(torch.cuda.memory_summary(0))
-    print(time.time()-t00)
+
     generated_tokens = outputs
+    t1 = time.time()
+    print(torch.cuda.memory_summary(0))
+    # calculate metrics
 
-t1 = time.time()
-# if dist.get_rank() == 0:
-# print(torch.cuda.memory_summary(0))
-# calculate metrics
+    tokens_gen_text = len(generated_tokens[0])
+    # print(generated_tokens.shape)
+    # for i in range(generated_tokens.shape[0]):
+    print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
 
-tokens_gen_text = len(generated_tokens[0])
-# print(generated_tokens.shape)
-# for i in range(generated_tokens.shape[0]):
-#     print("Response: {}".format(tokenizer.decode(generated_tokens[i, :])))
+    throughput = (tokens_gen_text) / ((t1 - t0))
 
-throughput = (tokens_gen_text) / ((t1 - t0) / interations)
-
-# view results
-print(f"""Tokens generated: {tokens_gen_text}
-Time: {t1 - t0:.1f} seconds
-Tokens per second: {throughput:.1f}
-Latency: {1000 / throughput:.1f} ms""")
+    # view results
+    print(f"""Tokens generated: {tokens_gen_text}
+    Time: {t1 - t0:.1f} seconds
+    Tokens per second: {throughput:.1f}
+    Latency: {1000 / throughput:.1f} ms""")

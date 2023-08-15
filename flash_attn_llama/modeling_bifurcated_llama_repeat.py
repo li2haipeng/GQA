@@ -31,7 +31,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers import LlamaConfig
-from flash_attn import flash_attn_kvpacked_func
+
 
 
 logger = logging.get_logger(__name__)
@@ -170,8 +170,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+class BifurcatedLlamaAttention(nn.Module):
+    """Bifurcated attention from sciense team"""
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -189,8 +189,6 @@ class LlamaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
@@ -214,29 +212,36 @@ class LlamaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-        # print(query_states.size(), key_states.size(), value_states.size())
-        # print(key_states[:4].shape, key_states[4:8].shape)
-        # print(torch.equal(key_states[:4], key_states[4:8]))
-        # sys.exit()
+        
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+            if past_key_value[0]["incremental"] is not None:
+                add_len = past_key_value[0]["context"].shape[-2] + past_key_value[0]["incremental"].shape[-2]        
+            else:
+                add_len = past_key_value[0]["context"].shape[-2]
+            kv_seq_len += add_len
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
+        key_states = repeat_kv(key_states, n_rep=self.n_rep)
+        value_states = repeat_kv(value_states, n_rep=self.n_rep)
+        
         if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        # key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        # value_states = repeat_kv(value_states, n_rep=self.n_rep)
- 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+            if past_key_value[0]["incremental"] is not None:
+                key_states = torch.cat([past_key_value[0]["incremental"], key_states], dim=2)
+            past_key_value[0]["incremental"] = key_states
+            t0 = time.time()
+            attn_weights_context = torch.matmul(query_states, past_key_value[0]["context"][0].transpose(-2, -1))
+            attn_weights_incremental = torch.matmul(query_states, key_states.transpose(2, 3))
+            attn_weights = torch.cat([attn_weights_context, attn_weights_incremental], dim=-1) / math.sqrt(self.head_dim)
+            # with open("debug_bi.txt", "a") as f:
+            #     f.write("{},{},{},{}\n".format(time.time()-t0, query_states.shape, past_key_value[0]["context"][0].shape, key_states.shape))
+            
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+    
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -255,10 +260,23 @@ class LlamaAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # attn_weights = self.dropout(attn_weights)
-
-        attn_output = torch.matmul(attn_weights, value_states)
-
+        
+        if past_key_value is not None:
+            if past_key_value[1]["incremental"] is not None:
+                value_states = torch.cat([past_key_value[1]["incremental"], value_states], dim=2)
+            past_key_value[1]["incremental"] = value_states
+            context_past_value_len = past_key_value[1]["context"].size()[-2]
+            t1 = time.time()
+            attn_output_context = torch.matmul(attn_weights[:, :, :, :context_past_value_len], past_key_value[1]["context"][0])
+            attn_out_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
+            attn_output = attn_output_context + attn_out_incremental
+            # print("t1", time.time()-t1)
+            # print("2", attn_output_context.shape, attn_out_incremental.shape, attn_output.shape)
+        else:
+            attn_output = torch.matmul(attn_weights, value_states)
+        
+        
+        # print("out", attn_output.size())
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -267,119 +285,21 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
         attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
-class FlashLlamaAttention(nn.Module):
-    """Flash Attention with GQA, need to stack kv first"""
-
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.kv_h = config.kv_h
-        self.n_rep = config. num_attention_heads // config.kv_h
-        self.max_position_embeddings = config.max_position_embeddings
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
-        
-
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
-     
-        # key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        # value_states = repeat_kv(value_states, n_rep=self.n_rep)
-
-        kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # [bsz, nh, t, hd]
+            # print("3", past_key.shape, past_value.shape)
+            past_key_value = (past_key_value[0], past_key_value[1]) if use_cache else None
+        else:
+            key = {}
+            value = {}
+            key["context"] = key_states
+            value["context"] = value_states
+            key["incremental"] = None
+            value["incremental"] = None
 
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            past_key_value = (key, value) if use_cache else None
 
-        past_key_value = (key_states, value_states) if use_cache else None
-        
-        kv_states = torch.stack([key_states.transpose(1, 2), value_states.transpose(1, 2)], dim=2)
-        attn_output, _, attn_weights = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, dropout_p=0.1, return_attn_probs=True)
-        # print(attn_output.shape, attn_weights.dtype)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_weights = None
-        # attn_weights = attn_weights.transpose(1, 2)
-
-        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # attn_output = torch.matmul(attn_weights, value_states)
-        
-        
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -391,9 +311,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
-        # self.self_attn = FlashLlamaAttention(config=config)
-
+        self.self_attn = BifurcatedLlamaAttention(config=config)
         # print("we are using:", self.self_attn.__class__)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -658,7 +576,11 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values_length = 0
 
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            if past_key_values[0][0]["incremental"] is not None:
+                past_key_values_length = past_key_values[0][0]["context"].shape[2] + past_key_values[0][0]["incremental"].shape[2]
+                # print(past_key_values[0][0]["context"].shape, past_key_values[0][0]["incremental"].shape)
+            else:
+                past_key_values_length = past_key_values[0][0]["context"].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
