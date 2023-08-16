@@ -21,7 +21,7 @@ DEFAULT_UNK_TOKEN = "<unk>"
 # model_config = AutoConfig.from_pretrained("huggyllama/llama-7b")
 # model_config.update({"kv_h": 8})
 
-model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/DS_llama_32/checkpoint-100")
+model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/DS_llama_8/checkpoint-100")
 # model = LlamaForCausalLM.from_pretrained("huggyllama/llama-7b", config=model_config)
 
 generation_config = GenerationConfig(
@@ -66,7 +66,7 @@ instructions = [
     # "Tell me five words that rhyme with 'shock'.",
     # "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
     # "Count up from 1 to 500."
-    ] 
+    ] * 5
 
 instructions = ["".join(instructions)] * 128
 # print(instructions)
@@ -93,7 +93,7 @@ for i in range(interations):
     tokens_gen_text = len(generated_tokens[0])
     # print(generated_tokens.shape)
     # for i in range(generated_tokens.shape[0]):
-    print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
+    # print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
 
     throughput = (tokens_gen_text) / ((t1 - t0))
 

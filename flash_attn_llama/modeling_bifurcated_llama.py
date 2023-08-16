@@ -31,7 +31,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers import LlamaConfig
-
+from flash_attn import flash_attn_kvpacked_func
 
 
 logger = logging.get_logger(__name__)
@@ -236,7 +236,6 @@ class BifurcatedLlamaAttention(nn.Module):
                 key_states = torch.cat([past_key_value[0][1], key_states], dim=2)
             past_key_value[0][1] = key_states
 
-
             if self.kv_h != self.num_heads and self.kv_h != 1:
                 # print(chunk_q[0].size(), past_key_value[0][0][0].size())
                 chunk_w_contxt = [torch.matmul(q, past_key_value[0][0][0].transpose(-2,-1)) for q in chunk_q]
@@ -335,11 +334,124 @@ class BifurcatedLlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
+class FlashBifurcatedLlamaAttention(nn.Module):
+    """Bifurcated attention + Flash attention"""
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.kv_h = config.kv_h
+        self.n_rep = config. num_attention_heads // config.kv_h
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.kv_h * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        self.dropout = nn.Dropout(0.1)
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
+        
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if past_key_value[0][1] is not None:
+                add_len = past_key_value[0][0].shape[-2] + past_key_value[0][1].shape[-2]        
+            else:
+                add_len = past_key_value[0][0].shape[-2]
+            kv_seq_len += add_len
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # [bsz, nh, t, hd]
+
+        
+        if past_key_value is not None:
+            if past_key_value[0][1] is not None:
+                key_states = torch.cat([past_key_value[0][1], key_states], dim=2)
+            if past_key_value[1][1] is not None:
+                value_states = torch.cat([past_key_value[1][1], value_states], dim=2)
+            past_key_value[0][1] = key_states
+            past_key_value[1][1] = value_states
+    
+            kv_states_context = torch.stack([past_key_value[0][0].transpose(1, 2), past_key_value[1][0].transpose(1, 2)], dim=2)
+            # print("1 ", query_states.transpose(1 ,2).size(), kv_states_context.size())
+            attn_output_context = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states_context, causal=True)
+            
+            # print("1",query_states.size(), key_states.size())                  
+            chunk_q = torch.chunk(query_states, self.n_rep, dim = 1)
+            chunk_w = [torch.matmul(q, key_states.transpose(2, 3)) for q in chunk_q]
+            # print("2",chunk_w[0].size(), value_states.size())
+            chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
+            
+            attn_output_incremental = torch.cat(chunk_o, dim=1)
+            # print(attn_output_context.size(), attn_output_incremental.size())
+            attn_output = attn_output_context + attn_output_incremental.transpose(1,2)
+            
+        else:
+            kv_states = torch.stack([key_states.transpose(1,2), value_states.transpose(1,2)], dim=2)
+            attn_output = flash_attn_kvpacked_func(query_states.transpose(1,2), kv_states, causal=True)
+        
+        
+        # print("out", attn_output.size())
+        # if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        #     raise ValueError(
+        #         f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+        #         f" {attn_output.size()}"
+        #     )
+
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        if past_key_value is not None:
+            # print("3", past_key.shape, past_value.shape)
+            past_key_value = (past_key_value[0], past_key_value[1]) if use_cache else None
+        else:
+            key = [[],[]]
+            value = [[],[]]
+            key[0] = key_states
+            value[0] = value_states
+            key[1] = None
+            value[1] = None
+
+            past_key_value = (key, value) if use_cache else None
+
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = BifurcatedLlamaAttention(config=config)
+        # self.self_attn = FlashBifurcatedLlamaAttention(config=config)
         # print("we are using:", self.self_attn.__class__)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
