@@ -1,41 +1,31 @@
-# -*- coding: utf-8 -*-
 import torch
+import torch.nn.functional as F
+import math
 import time
-a = torch.randint(high = 2,size=(256, 32, 1, 128), dtype=torch.float16).cuda(0)
-b = torch.randint(high = 2,size=(32, 100, 128), dtype=torch.float16).cuda(0)
-c = torch.randint(high = 2,size=(256, 32, 256, 128), dtype=torch.float16).cuda(0)
+# Optionally use the context manager to ensure one of the fused kerenels is run
+query = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
+key = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
+value = torch.rand(32, 8, 128, 64, dtype=torch.float16, device="cuda")
 
-for i in range(3):
+with torch.backends.cuda.sdp_kernel(enable_flash = False, enable_mem_efficient=True, enable_math=False):
     start = time.time()
-    # c = torch.stack([a,b], dim=2)
-    # z = torch.einsum("bhld, igdm->bhlm", a,b)
-    # t0 = time.time()
-    # z = torch.matmul(a,b.transpose(-2,-1))
-    # # print("1",time.time()-t0)
-    # zz = torch.matmul(a, c.transpose(2,3))
-    # # print("2",time.time()-t0)
-    # r = torch.cat([z, zz], dim=-1) 
-    c = c.transpose(1,2)
-    # print(r.shape)
+    a = F.scaled_dot_product_attention(query,key,value, is_causal=False)
     print(time.time()-start)
-# print(torch.cuda.memory_summary(0))
 
 
-
-# a = torch.randint(high = 2,size=(256, 32, 1, 128), dtype=torch.float16).cuda(0)
-# b = torch.randint(high = 2,size=(256, 32, 356, 128), dtype=torch.float16).cuda(0)
-# for i in range(3):
+# with torch.backends.cuda.sdp_kernel(enable_flash = False, enable_mem_efficient=False, enable_math=True):
 #     start = time.time()
-#     # z = torch.einsum("bhld, igdm->bhlm", a,b)
-#     z = torch.matmul(a,b.transpose(-2,-1))
-#     # print(z.shape)
+#     b = F.scaled_dot_product_attention(query,key,value, is_causal=False)
 #     print(time.time()-start)
-#     # zz = torch.matmul(a, c.transpose(2,3))
-# print(torch.cuda.memory_summary(0))
 
-
-
-
-
-
-
+# Efficient implementation equivalent to the following:
+# attn_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0) if is_causal else attn_mask
+# attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
+start = time.time()
+attn_weight = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(64)
+attn_weight = torch.nn.functional.softmax(attn_weight, dim=-1, dtype=torch.float32).to(query.dtype)
+# attn_weight = torch.dropout(attn_weight, dropout_p)
+b = torch.matmul(attn_weight, value)
+print(time.time()-start)
+print(a[0],b[0])
+print(torch.equal(a,b))

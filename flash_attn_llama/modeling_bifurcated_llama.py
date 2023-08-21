@@ -24,6 +24,7 @@ import sys
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import time
 from transformers.activations import ACT2FN
@@ -288,12 +289,12 @@ class BifurcatedLlamaAttention(nn.Module):
                 chunk_o_contxt = [torch.matmul(w_c, past_key_value[1][0][0]) for w_c in chunk_w_contxt]
                 attn_output_context = torch.cat(chunk_o_contxt, dim=1)
                 chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
-                attn_out_incremental = torch.cat(chunk_o, dim=1)
+                attn_output_incremental = torch.cat(chunk_o, dim=1)
             else:
                 attn_output_context = torch.matmul(attn_weights[:, :, :, :context_past_value_len], past_key_value[1][0][0])
-                attn_out_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
+                attn_output_incremental = torch.matmul(attn_weights[:, :, :, context_past_value_len:], value_states)
 
-            attn_output = attn_output_context + attn_out_incremental
+            attn_output = attn_output_context + attn_output_incremental
 
         else:
             if self.kv_h != self.num_heads and self.kv_h != 1:
@@ -387,8 +388,10 @@ class FlashBifurcatedLlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
+        seqlen_q, seqlen_k = query_states.shape[2], key_states.shape[2]
+        key_states = repeat_kv(key_states, n_rep=self.n_rep)
+        value_states = repeat_kv(value_states, n_rep=self.n_rep)
 
-        
         if past_key_value is not None:
             if past_key_value[0][1] is not None:
                 key_states = torch.cat([past_key_value[0][1], key_states], dim=2)
@@ -397,23 +400,32 @@ class FlashBifurcatedLlamaAttention(nn.Module):
             past_key_value[0][1] = key_states
             past_key_value[1][1] = value_states
     
-            kv_states_context = torch.stack([past_key_value[0][0].transpose(1, 2), past_key_value[1][0].transpose(1, 2)], dim=2)
-            # print("1 ", query_states.transpose(1 ,2).size(), kv_states_context.size())
-            attn_output_context = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states_context, causal=True)
+            # kv_states_context = torch.stack([past_key_value[0][0].transpose(1, 2), past_key_value[1][0].transpose(1, 2)], dim=2)
+            # attn_output_context = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states_context, causal=True)
             
-            # print("1",query_states.size(), key_states.size())                  
-            chunk_q = torch.chunk(query_states, self.n_rep, dim = 1)
-            chunk_w = [torch.matmul(q, key_states.transpose(2, 3)) for q in chunk_q]
-            # print("2",chunk_w[0].size(), value_states.size())
-            chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False):
+                # is_causal = seqlen_q == seqlen_k
+                attn_output_context = F.scaled_dot_product_attention(query_states,key_states,value_states, is_causal = True)
             
-            attn_output_incremental = torch.cat(chunk_o, dim=1)
+            # print("1",query_states.size(), key_states.size())
+            if self.kv_h != self.num_heads and self.kv_h != 1:                  
+                chunk_q = torch.chunk(query_states, self.n_rep, dim = 1)
+                chunk_w = [torch.matmul(q, key_states.transpose(2, 3)) for q in chunk_q]
+                # print("2",chunk_w[0].size(), value_states.size())
+                chunk_o = [torch.matmul(w, value_states) for w in chunk_w]
+                
+                attn_output_incremental = torch.cat(chunk_o, dim=1)
+            else:
+                attn_weight_incremental = torch.matmul(query_states, key_states.transpose(2,3)) / math.sqrt(self.head_dim)
+                attn_output_incremental = torch.matmul(attn_weight_incremental, value_states)
             # print(attn_output_context.size(), attn_output_incremental.size())
-            attn_output = attn_output_context + attn_output_incremental.transpose(1,2)
+            attn_output = attn_output_context + attn_output_incremental
             
         else:
-            kv_states = torch.stack([key_states.transpose(1,2), value_states.transpose(1,2)], dim=2)
-            attn_output = flash_attn_kvpacked_func(query_states.transpose(1,2), kv_states, causal=True)
+            # kv_states = torch.stack([key_states.transpose(1,2), value_states.transpose(1,2)], dim=2)
+            # attn_output = flash_attn_kvpacked_func(query_states.transpose(1,2), kv_states, causal=True)
+            is_causal = seqlen_q == seqlen_k
+            attn_output = F.scaled_dot_product_attention(query_states,key_states,value_states, is_causal = True)
         
         
         # print("out", attn_output.size())

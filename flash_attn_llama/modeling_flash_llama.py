@@ -24,6 +24,7 @@ import sys
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from torch.nn import functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import time
 from transformers.activations import ACT2FN
@@ -31,7 +32,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers import LlamaConfig
-from flash_attn import flash_attn_kvpacked_func
+from flash_attn import flash_attn_kvpacked_func, flash_attn_qkvpacked_func
 
 
 logger = logging.get_logger(__name__)
@@ -319,13 +320,9 @@ class FlashLlamaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.kv_h, self.head_dim).transpose(1, 2)
      
-        # key_states = repeat_kv(key_states, n_rep=self.n_rep)
-        # value_states = repeat_kv(value_states, n_rep=self.n_rep)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -340,42 +337,24 @@ class FlashLlamaAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
-        
-        kv_states = torch.stack([key_states.transpose(1, 2), value_states.transpose(1, 2)], dim=2)
-        attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, causal=True)
-        # attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states)
+        seqlen_q, seqlen_k = query_states.shape[2], key_states.shape[2]
 
-        # print(attn_output.shape, attn_weights.dtype)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_weights = None
-        
-        
-        # if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-        #     raise ValueError(
-        #         f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-        #         f" {attn_weights.size()}"
-        #     )
-        
-        # if attention_mask is not None:
-        #     if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-        #         raise ValueError(
-        #             f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-        #         )
-        #     attn_weights = attn_weights + attention_mask
-        #     attn_weights = torch.max(
-        #         attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-        #     )
+        # kv_states = torch.stack([key_states.transpose(1, 2), value_states.transpose(1, 2)], dim=2)
+        # if self.training:
+        #     attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, causal=True)
+        # else:    
+        #     is_causal = seqlen_q == seqlen_k
+        #     attn_output = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states, causal=is_causal)
 
-        # # upcast attention to fp32
-        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # attn_output = torch.matmul(attn_weights, value_states)
-        
-        
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+        key_states = repeat_kv(key_states, n_rep=self.n_rep)
+        value_states = repeat_kv(value_states, n_rep=self.n_rep)
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False):
+            if self.training:
+                attn_output = F.scaled_dot_product_attention(query_states,key_states,value_states, is_causal = True)
+            else:
+                is_causal = seqlen_q == seqlen_k
+                attn_output = F.scaled_dot_product_attention(query_states,key_states,value_states, is_causal = is_causal)
+
 
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -440,6 +419,7 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+
         hidden_states = residual + hidden_states
 
         # Fully Connected

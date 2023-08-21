@@ -9,20 +9,22 @@ from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 import sys
 sys.path.append("..")
 import torch.distributed as dist
-# from flash_attn_llama.modeling_flash_llama import LlamaForCausalLM
-from flash_attn_llama.modeling_bifurcated_llama import LlamaForCausalLM
+from flash_attn_llama.modeling_flash_llama import LlamaForCausalLM
+# from flash_attn_llama.modeling_bifurcated_llama import LlamaForCausalLM
 from transformers import LlamaTokenizer
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "<s>"
 DEFAULT_UNK_TOKEN = "<unk>"
 
+kv_h=32
+model_config = AutoConfig.from_pretrained("huggyllama/llama-7b")
+model_config.update({"kv_h": kv_h})
 
-# model_config = AutoConfig.from_pretrained("huggyllama/llama-7b")
-# model_config.update({"kv_h": 8})
-
-model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/DS_llama_8/checkpoint-100")
+model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/Flash_DS_llama_8/checkpoint-1000")
 # model = LlamaForCausalLM.from_pretrained("huggyllama/llama-7b", config=model_config)
+# model = LlamaForCausalLM(model_config)
+
 
 generation_config = GenerationConfig(
     temperature=0.1,
@@ -34,7 +36,12 @@ ds_engine = deepspeed.init_inference(model,
                                  mp_size=1,
                                  dtype=torch.half,
                                  replace_with_kernel_inject=True)
+# print("1", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
+# torch.cuda.empty_cache()
+# print("2", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
 model = ds_engine.module
+pytorch_total_params = sum(p.numel() for p in model.parameters())
+print("Param: {:.2f}".format(pytorch_total_params/1000/1000))
 
 tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
 
@@ -66,12 +73,12 @@ instructions = [
     # "Tell me five words that rhyme with 'shock'.",
     # "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
     # "Count up from 1 to 500."
-    ] * 5
+    ] * 1
 
-instructions = ["".join(instructions)] * 128
+# instructions = ["".join(instructions)] * 256
 # print(instructions)
 
-inputs = tokenizer(instructions, return_tensors="pt", padding=True)["input_ids"]
+inputs = tokenizer(instructions, return_tensors="pt")["input_ids"]
 
 
 interations = 3
@@ -87,13 +94,16 @@ for i in range(interations):
 
     generated_tokens = outputs
     t1 = time.time()
-    print(torch.cuda.memory_summary(0))
+    # print(torch.cuda.memory_summary())
+    # print("1", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
+    # torch.cuda.empty_cache()
+    # print("2", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
     # calculate metrics
 
     tokens_gen_text = len(generated_tokens[0])
     # print(generated_tokens.shape)
     # for i in range(generated_tokens.shape[0]):
-    # print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
+    print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
 
     throughput = (tokens_gen_text) / ((t1 - t0))
 
