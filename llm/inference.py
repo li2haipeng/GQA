@@ -1,30 +1,43 @@
-# import wandb
-# wandb.login()
-# wandb.init(project="pytorch-demo", name="flash_1_eval")
 from transformers import pipeline, AutoTokenizer, AutoConfig, GenerationConfig, AutoModelForCausalLM
 import torch
 import time
 import deepspeed
-from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 import sys
+import os
 sys.path.append("..")
 import torch.distributed as dist
-from flash_attn_llama.modeling_flash_llama import LlamaForCausalLM
-# from flash_attn_llama.modeling_bifurcated_llama import LlamaForCausalLM
+import utils
+from flash_attn_llama.modeling_flash_llama_2 import LlamaForCausalLM
 from transformers import LlamaTokenizer
+from taeho_llama_train_ds import PROMPT_DICT
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "<s>"
 DEFAULT_UNK_TOKEN = "<unk>"
 
-kv_h=32
-model_config = AutoConfig.from_pretrained("huggyllama/llama-7b")
-model_config.update({"kv_h": kv_h})
+kv_h=int(sys.argv[1])
+batch_size = int(sys.argv[2])
+print("kv_h: {}, batch: {}".format(kv_h, batch_size))
+model_config = AutoConfig.from_pretrained("NousResearch/Llama-2-7b-hf")
+# model_config = AutoConfig.from_pretrained("huggyllama/llama-7b")
+model_config.update({"num_key_value_heads": kv_h})
+# model_config.update({"kv_h": kv_h})
+print(model_config)
 
-model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/Flash_DS_llama_8/checkpoint-1000")
-# model = LlamaForCausalLM.from_pretrained("huggyllama/llama-7b", config=model_config)
-# model = LlamaForCausalLM(model_config)
+# model = LlamaForCausalLM(config=model_config)
+model = LlamaForCausalLM.from_pretrained("/home/ubuntu/GQA/trained/alpaca_llama2_8/checkpoint-300", config=model_config)
+model.cuda().half()
 
+
+def generate_prompt(instruction, input=None):
+  if input:
+    return PROMPT_DICT["prompt_input"].format(instruction=instruction, input=input)
+  else:
+    return PROMPT_DICT["prompt_no_input"].format(instruction=instruction)
+
+
+
+os.environ["CUDA_VISIBLE_DEVICES"] = str(0)
 
 generation_config = GenerationConfig(
     temperature=0.1,
@@ -32,18 +45,12 @@ generation_config = GenerationConfig(
     num_beams=1,
 )
 
-ds_engine = deepspeed.init_inference(model,
-                                 mp_size=1,
-                                 dtype=torch.half,
-                                 replace_with_kernel_inject=True)
-# print("1", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
-# torch.cuda.empty_cache()
-# print("2", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
-model = ds_engine.module
+
 pytorch_total_params = sum(p.numel() for p in model.parameters())
 print("Param: {:.2f}".format(pytorch_total_params/1000/1000))
 
-tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
+tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+# tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
 
 
 
@@ -61,26 +68,14 @@ if tokenizer.pad_token is None:
 model.resize_token_embeddings(len(tokenizer))
 
 instructions = [
-    # "Tell me about alpacas.",
-    # "Tell me about the king of France in 2019.",
     "Tell me about the president of Mexico in 2019.",
-    # "Tell me about the president of America in 2001.",
-    # "What is the background of the president of France in 2001.",
-    # "Who is the president of Korea in 1988.",
-    # "List all Canadian provinces in alphabetical order.",
-    # "Write a Python program that prints the first 10 Fibonacci numbers.",
-    # "Write a program that prints the numbers from 1 to 100. But for multiples of three print 'Fizz' instead of the number and for the multiples of five print 'Buzz'. For numbers which are multiples of both three and five print 'FizzBuzz'.",
-    # "Tell me five words that rhyme with 'shock'.",
-    # "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
-    # "Count up from 1 to 500."
     ] * 1
-
-# instructions = ["".join(instructions)] * 256
+# instructions = ["".join(instructions)] * batch_size
 # print(instructions)
 
-inputs = tokenizer(instructions, return_tensors="pt")["input_ids"]
+inputs = tokenizer(generate_prompt(instructions, None), return_tensors="pt")["input_ids"]
 
-
+print(inputs.size())
 interations = 3
 print("start...")
 for i in range(interations):
@@ -94,17 +89,11 @@ for i in range(interations):
 
     generated_tokens = outputs
     t1 = time.time()
-    # print(torch.cuda.memory_summary())
-    # print("1", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
-    # torch.cuda.empty_cache()
-    # print("2", {torch.cuda.memory_allocated()}, {torch.cuda.memory_cached()})
-    # calculate metrics
+    print(torch.cuda.memory_summary())
 
     tokens_gen_text = len(generated_tokens[0])
-    # print(generated_tokens.shape)
-    # for i in range(generated_tokens.shape[0]):
-    print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
 
+    print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
     throughput = (tokens_gen_text) / ((t1 - t0))
 
     # view results
