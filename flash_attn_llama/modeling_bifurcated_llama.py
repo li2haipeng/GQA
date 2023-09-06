@@ -403,9 +403,9 @@ class FlashBifurcatedLlamaAttention(nn.Module):
             # kv_states_context = torch.stack([past_key_value[0][0].transpose(1, 2), past_key_value[1][0].transpose(1, 2)], dim=2)
             # attn_output_context = flash_attn_kvpacked_func(query_states.transpose(1 ,2), kv_states_context, causal=True)
             
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False):
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False):
                 # is_causal = seqlen_q == seqlen_k
-                attn_output_context = F.scaled_dot_product_attention(query_states,key_states,value_states, is_causal = True)
+                attn_output_context = F.scaled_dot_product_attention(query_states, past_key_value[0][0], past_key_value[1][0], is_causal = True)
             
             # print("1",query_states.size(), key_states.size())
             if self.kv_h != self.num_heads and self.kv_h != 1:                  
@@ -418,6 +418,7 @@ class FlashBifurcatedLlamaAttention(nn.Module):
             else:
                 attn_weight_incremental = torch.matmul(query_states, key_states.transpose(2,3)) / math.sqrt(self.head_dim)
                 attn_output_incremental = torch.matmul(attn_weight_incremental, value_states)
+
             # print(attn_output_context.size(), attn_output_incremental.size())
             attn_output = attn_output_context + attn_output_incremental
             
