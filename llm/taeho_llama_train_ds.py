@@ -23,7 +23,8 @@ import transformers
 import utils
 from torch.utils.data import Dataset
 from transformers import Trainer, AutoConfig
-from flash_attn_llama.modeling_flash_llama_2 import LlamaForCausalLM
+from transformers import LlamaForCausalLM
+# from flash_attn_llama.modeling_flash_llama_2 import LlamaForCausalLM
 import torch.distributed as dist
 import GPUtil
 import psutil
@@ -225,7 +226,7 @@ def train():
             # q_per_group = model_config.num_attention_heads // model_config.num_key_value_heads
             if kv_h != 32:
                 if 'k_proj' in n or 'v_proj' in n:
-                    x = utils.group_weight(x, model_config.num_attention_heads, model_config.num_key_value_heads, model_config.hidden_size)
+                    x = utils.group_weight(x, model_config.num_attention_heads, model_config.num_key_value_heads, model_config.hidden_size, type='first')
         p.data.copy_(x)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,

@@ -5,6 +5,7 @@ import os
 import io
 import sys
 import time
+import numpy as np
 import json
 from typing import Optional, Sequence, Union
 import torch
@@ -80,16 +81,27 @@ def dataset_mapping(trained_tokenizer, raw_dataset, max_seq_length):
 #     return w_l
 
 
-def group_weight(w, q_h, kv_h, hidden_size):
+def group_weight(w, q_h, kv_h, hidden_size, type='ave'):
     w_l = list()
     q_per_group = q_h // kv_h
     assert len(w.shape) == 2
     w = w.view(q_h, -1, hidden_size)
-    w_chunk = w.chunk(kv_h)
-    for i in range(len(w_chunk)):
-        grouped_w = torch.sum(w_chunk[i], dim=0) / q_per_group
-        w_l.append(grouped_w)
-    w_l = torch.cat(w_l, dim=0)
+    if type == 'ave': 
+        w_chunk = w.chunk(kv_h)
+        for i in range(len(w_chunk)):
+            grouped_w = torch.sum(w_chunk[i], dim=0) / q_per_group
+            w_l.append(grouped_w)
+        w_l = torch.cat(w_l, dim=0)
+    else:
+        # window = np.array([i for i in range(q_per_group)])
+        # indices = [window + i * kv_h for i in range(kv_h)]
+        # indices = [i for i in range(0, q_h, q_per_group)]
+        w_sum = torch.sum(torch.abs(w), (1,2))
+        # for i in range(kv_h):
+        # w_l = w[:kv_h].view(-1, hidden_size)
+        w_l = torch.argsort(w_sum)[:kv_h]
+        # print(w_l.size())
+
     return w_l
 
 

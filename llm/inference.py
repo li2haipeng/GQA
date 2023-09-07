@@ -69,8 +69,8 @@ model.resize_token_embeddings(len(tokenizer))
 
 instructions = [
     "Tell me about the president of Mexico in 2019.",
-    ] * 1
-# instructions = ["".join(instructions)] * batch_size
+    ] * 10
+instructions = ["".join(instructions)] * batch_size
 # print(instructions)
 
 inputs = tokenizer(generate_prompt(instructions, None), return_tensors="pt")["input_ids"]
@@ -79,7 +79,7 @@ print(inputs.size())
 interations = 3
 print("start...")
 for i in range(interations):
-    t0 = time.time()
+    
     print("run:", i)
 
     outputs = model.generate(input_ids=inputs.cuda(),
@@ -92,7 +92,7 @@ for i in range(interations):
     print(torch.cuda.memory_summary())
 
     tokens_gen_text = len(generated_tokens[0])
-
+    t0 = time.time()
     print("Response: {}".format(tokenizer.decode(generated_tokens[0, :])))
     throughput = (tokens_gen_text) / ((t1 - t0))
 

@@ -961,7 +961,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # print(torch.cuda.memory_summary())
+        
+        # logits = logits.float()
+        # print(logits.size())
+        # print(torch.cuda.memory_summary())
+        # import sys
+        # sys.exit()
 
         loss = None
         if labels is not None:

@@ -5,7 +5,7 @@ torchrun --nproc_per_node=8 taeho_llama_train_ds.py \
     --kv_h 8 \
     --data_path ../alpaca_data.json \
     --bf16 True \
-    --output_dir /home/ubuntu/GQA/trained/alpaca_llama2_8_flash \
+    --output_dir /home/ubuntu/GQA/trained/alpaca_llama2_8_first \
     --num_train_epochs 10 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
